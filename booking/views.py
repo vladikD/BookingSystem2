@@ -1,8 +1,73 @@
+from django.db import transaction
+from django.db.models import Sum, Avg, Q, F
+
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+
 from .models import User, Room, Booking, Payment, Service, BookingService, Discount, Review
+
 from .serializers import UserSerializer, RoomSerializer, BookingSerializer, PaymentSerializer, ServiceSerializer, BookingServiceSerializer, DiscountSerializer, ReviewSerializer
+from django.views.decorators.cache import cache_page
+from django.utils.decorators import method_decorator
+from datetime import datetime
+
+
+class StatisticsView(APIView):
+    def get(self, request):
+        total_users = User.objects.count()
+        total_bookings = Booking.objects.count()
+        total_payments = Payment.objects.aggregate(total_amount=Sum('amount'))['total_amount']
+        average_room_price = Room.objects.aggregate(average_price=Avg('price'))['average_price']
+        total_services = Service.objects.count()
+        total_booking_services = BookingService.objects.count()
+        total_discounts = Discount.objects.count()
+        total_reviews = Review.objects.count()
+        average_rating = Review.objects.aggregate(average_rating=Avg('rating'))['average_rating']
+
+        statistics = {
+            'total_users': total_users,
+            'total_bookings': total_bookings,
+            'total_payments': total_payments,
+            'average_room_price': average_room_price,
+            'total_services': total_services,
+            'total_booking_services': total_booking_services,
+            'total_discounts': total_discounts,
+            'total_reviews': total_reviews,
+            'average_rating': average_rating,
+        }
+        return Response(statistics)
+
+
+class RoomFilterView(APIView):
+    def get(self, request):
+        min_price = request.GET.get('min_price')
+        max_price = request.GET.get('max_price')
+        search_term = request.GET.get('search_term', '')
+
+        filters = Q()
+
+        if min_price:
+            filters &= Q(price__gte=min_price)
+
+        if max_price:
+            filters &= Q(price__lte=max_price)
+
+        if search_term:
+            filters &= Q(room_number__icontains=search_term) | Q(room_type__icontains=search_term)
+
+        rooms = Room.objects.filter(filters)
+
+        room_list = [{
+            'room_id': room.room_id,
+            'room_number': room.room_number,
+            'room_type': room.room_type,
+            'price': room.price,
+            'availability': room.availability
+        } for room in rooms]
+
+        return Response(room_list)
+
 
 class UserListView(APIView):
     def get(self, request):
@@ -55,6 +120,23 @@ class UserDetailView(APIView):
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
         user.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class UpdateRoomAvailabilityAPIView(APIView):
+    def post(self, request):
+        try:
+            booking_id = request.data.get('booking_id')
+
+            # Знайти кількість заброньованих кімнат за заданим ідентифікатором бронювання
+            booked_rooms_count = BookingService.objects.filter(booking_id=booking_id).count()
+
+            # Оновити кількість доступних кімнат за допомогою F-виразу
+            Room.objects.update(availability=F('availability') - booked_rooms_count)
+
+            return Response("Кількість доступних кімнат оновлена успішно", status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response(f"Помилка під час оновлення кількості доступних кімнат: {str(e)}",
+                            status=status.HTTP_400_BAD_REQUEST)
 
 
 class RoomListView(APIView):
@@ -123,7 +205,45 @@ class RoomCreateView(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+class CreateBookingView(APIView):
+    @transaction.atomic
+    def post(self, request):
+        try:
+            user_id = request.data.get('user_id')
+            room_id = request.data.get('room_id')
+            amount = request.data.get('amount')
+            payment_method = request.data.get('payment_method')
+
+            # Створення нового бронювання
+            booking = Booking(
+                booking_date=datetime.now(),
+                check_in_date=request.data.get('check_in_date'),
+                check_out_date=request.data.get('check_out_date'),
+                user_id=user_id,
+                room_id=room_id
+            )
+            booking.save()
+
+            # Створення платежу для цього бронювання
+            payment = Payment(
+                amount=amount,
+                date=datetime.now(),
+                payment_method=payment_method,
+                booking=booking
+            )
+            payment.save()
+
+            return Response({'message': 'Booking and payment created successfully'}, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
 class BookingListView(APIView):
+    @method_decorator(cache_page(60 * 15))
+    def dispatch(self, *args, **kwargs):
+        return super().dispatch(*args, **kwargs)
     def get(self, request):
         bookings = Booking.objects.all()
 
@@ -152,6 +272,7 @@ class BookingListView(APIView):
         if room_id:
             bookings = bookings.filter(room_id=room_id)
 
+        bookings = bookings.select_related('user', 'room')
         serializer = BookingSerializer(bookings, many=True)
         return Response(serializer.data)
 
@@ -355,6 +476,8 @@ class DiscountListView(APIView):
         if service_name:
             discounts = discounts.filter(services__name__icontains=service_name)
 
+
+        discounts = discounts.prefetch_related('services')
         serializer = DiscountSerializer(discounts, many=True)
         return Response(serializer.data)
 
